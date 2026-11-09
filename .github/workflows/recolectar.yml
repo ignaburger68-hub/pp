@@ -1,0 +1,87 @@
+# Recolector del feed GBFS de Ecobici en GitHub Actions (versión 3)
+#
+# Cada ejecución dura casi 6 horas (el máximo que permite GitHub): lee el feed
+# una vez por minuto y cada 30 minutos sube un archivo .csv.gz al repositorio.
+# Al empezar, cada ejecución lanza la siguiente, que queda en espera y parte
+# apenas termine la actual: la cadena se sostiene sola. La programación horaria
+# queda solo como respaldo, porque GitHub no siempre la respeta.
+# Es normal ver ejecuciones "cancelled" en Actions: son esperas que fueron
+# reemplazadas por otra más nueva.
+# Para detener todo: Actions -> Recolectar Ecobici -> "..." -> Disable workflow,
+# y luego cancelar la ejecución que esté en espera.
+
+name: Recolectar Ecobici
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:          # botón "Run workflow" para probar a mano
+    inputs:
+      bloques:
+        description: "Número de bloques (11 = unas 5,5 horas)"
+        required: false
+        default: "11"
+      minutos:
+        description: "Minutos por bloque"
+        required: false
+        default: "30"
+
+permissions:
+  contents: write             # permite subir los datos al repositorio
+  actions: write              # permite lanzar la ejecución siguiente
+
+concurrency:
+  group: recolector           # nunca dos ejecuciones al mismo tiempo
+  cancel-in-progress: false
+
+jobs:
+  recolectar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Dejar lanzada la ejecución siguiente
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run recolectar.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+            && echo "Siguiente ejecución lanzada (queda en espera)" \
+            || echo "No se pudo lanzar la siguiente; queda el respaldo horario"
+
+      - name: Instalar R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Instalar jsonlite
+        run: Rscript -e 'install.packages("jsonlite")'
+
+      - name: Leer el feed y subir los datos cada bloque
+        env:
+          BLOQUES_MANUAL: ${{ github.event.inputs.bloques }}
+          MINUTOS_MANUAL: ${{ github.event.inputs.minutos }}
+        run: |
+          BLOQUES=11; MINUTOS=30
+          [[ "$BLOQUES_MANUAL" =~ ^[0-9]+$ ]] && BLOQUES=$BLOQUES_MANUAL
+          [[ "$MINUTOS_MANUAL" =~ ^[0-9]+$ ]] && MINUTOS=$MINUTOS_MANUAL
+          git config user.name "recolector-ecobici"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          subir() {
+            git add datos
+            if git diff --cached --quiet; then echo "Sin datos nuevos"; return 0; fi
+            git commit -q -m "Lecturas $(date -u +'%Y-%m-%d %H:%M') UTC"
+            for intento in 1 2 3; do
+              git pull -q --rebase && git push -q && return 0
+              sleep 10
+            done
+            echo "No se pudo subir; se reintenta en el próximo bloque"
+          }
+
+          for i in $(seq 1 $BLOQUES); do
+            echo "Bloque $i de $BLOQUES: $MINUTOS minutos"
+            Rscript recolector_ecobici.R --minutos=$MINUTOS || echo "El bloque $i terminó con error"
+            subir
+          done
